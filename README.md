@@ -5,7 +5,7 @@ command and get a webpage showing which files call which providers, what models
 you use, and what each agent is responsible for.
 
 ```bash
-pip install agentmap
+pip install agentmap-scan
 cd your-project
 agentmap
 ```
