@@ -10,6 +10,7 @@ Ruby, Java, shell/curl, etc., not just the Python/JS SDKs.
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,8 @@ _SKIP_DIRS = {
     ".git", "node_modules", "dist", "build", ".next", ".venv", "venv",
     "__pycache__", ".pytest_cache", ".mypy_cache", "vendor", "target",
     ".vercel", "site-packages", ".idea", ".vscode",
+    ".nx", ".turbo", ".cache", ".parcel-cache", ".pnpm-store", ".yarn",
+    ".gradle", ".tox", ".ruff_cache", "coverage", ".angular", ".svelte-kit",
 }
 # Binary / non-source extensions to skip outright.
 _SKIP_EXT = {
@@ -44,11 +47,17 @@ class Finding:
 
 
 def scan(root: str | Path) -> list[Finding]:
-    """Scan `root` recursively and return one Finding per (file, line, provider)."""
+    """Scan `root` recursively and return one Finding per (file, line, provider).
+
+    Accepts a directory or a single file. Raises FileNotFoundError for a
+    missing path so callers surface typos instead of reporting an empty repo.
+    """
     root = Path(root)
+    if not root.exists():
+        raise FileNotFoundError(f"path does not exist: {root}")
     patterns = list(iter_patterns())
     findings: list[Finding] = []
-    for path in _walk(root):
+    for path in ([root] if root.is_file() else _walk(root)):
         try:
             text = path.read_text(encoding="utf-8", errors="strict")
         except (UnicodeDecodeError, OSError):
@@ -73,19 +82,21 @@ def scan(root: str | Path) -> list[Finding]:
 
 
 def _walk(root: Path):
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        if any(part in _SKIP_DIRS for part in path.parts):
-            continue
-        if path.suffix.lower() in _SKIP_EXT or path.name.endswith(".min.js"):
-            continue
-        try:
-            if path.stat().st_size > _MAX_BYTES:
+    # os.walk with in-place pruning: skipped dirs (node_modules, .nx, …) are
+    # never entered, so we never stat pnpm/Nx cache paths that exceed Windows
+    # MAX_PATH and raise WinError 5. onerror keeps unreadable dirs non-fatal.
+    for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        for name in filenames:
+            path = Path(dirpath) / name
+            if path.suffix.lower() in _SKIP_EXT or name.lower().endswith(".min.js"):
                 continue
-        except OSError:
-            continue
-        yield path
+            try:
+                if not path.is_file() or path.stat().st_size > _MAX_BYTES:
+                    continue
+            except OSError:
+                continue  # broken symlink, too-long path, access denied
+            yield path
 
 
 def call_sites(findings: list[Finding]) -> list[Finding]:
@@ -160,8 +171,11 @@ def apply_autofix(findings: list[Finding], proxy: str = "http://localhost:4242")
         p = Path(path)
         if p.suffix.lower() == ".md":
             continue
-        lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
-        changed = False
+        try:
+            lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
+        except (OSError, UnicodeDecodeError):
+            continue  # deleted/unreadable since the scan — skip, don't crash
+        file_edits: list[tuple[str, int, str]] = []
         for f in fs:
             spec = PROVIDERS_BY_ID[f.provider]
             target = _route_target(spec, proxy)
@@ -174,10 +188,13 @@ def apply_autofix(findings: list[Finding], proxy: str = "http://localhost:4242")
             after = url_re.sub(target, before)
             if after != before:
                 lines[f.line - 1] = after
-                edits.append((path, f.line, after.strip()))
-                changed = True
-        if changed:
-            p.write_text("".join(lines), encoding="utf-8")
+                file_edits.append((path, f.line, after.strip()))
+        if file_edits:
+            try:
+                p.write_text("".join(lines), encoding="utf-8")
+            except OSError:
+                continue  # read-only file — report only edits that landed
+            edits.extend(file_edits)
     return edits
 
 
@@ -196,7 +213,12 @@ def _selfcheck() -> None:
     with tempfile.TemporaryDirectory() as d:
         for name, body in fixtures.items():
             (Path(d) / name).write_text(body)
+        # vendored/cache trees must be pruned, never scanned (see _walk)
+        vendored = Path(d) / ".nx" / "cache" / "node_modules" / "dep"
+        vendored.mkdir(parents=True)
+        (vendored / "index.js").write_text('fetch("https://api.openai.com/v1/x")\n')
         f = scan(d)
+        assert not any("node_modules" in x.path for x in f), "scanned vendored dir"
         found = providers_found(f)
         assert "openai" in found, found
         assert "anthropic" in found, found

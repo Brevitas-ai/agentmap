@@ -5,6 +5,7 @@ responsibilities, and the routing plan. No backend, no JS — one self-contained
 from __future__ import annotations
 
 import html as _html
+import os
 import tempfile
 import webbrowser
 from collections import Counter
@@ -160,8 +161,16 @@ route these calls through <b>Brevitas</b> to compress context and cut token cost
 
 
 def render_and_open(path, findings, plan, agents, purposes, open_browser=True) -> Path:
+    doc = build_html(str(path), findings, plan, agents, purposes)
     out = Path(tempfile.gettempdir()) / "agentmap_report.html"
-    out.write_text(build_html(str(path), findings, plan, agents, purposes), encoding="utf-8")
+    try:
+        out.write_text(doc, encoding="utf-8")
+    except OSError:
+        # fixed name unwritable (e.g. owned by another user on a shared box)
+        fd, name = tempfile.mkstemp(prefix="agentmap_", suffix=".html")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(doc)
+        out = Path(name)
     if open_browser:
-        webbrowser.open(f"file://{out}")
+        webbrowser.open(out.resolve().as_uri())  # as_uri handles Windows drive paths
     return out
